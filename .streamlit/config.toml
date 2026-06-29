@@ -1,0 +1,17 @@
+# Native Streamlit theme — version-proof, replaces the stale data-testid CSS hacks.
+# Dark base kept from the original palette; accent switched to emerald (was rendering
+# as Streamlit's default red because the custom CSS selectors no longer match 1.58+).
+
+[theme]
+base = "dark"
+primaryColor = "#10B981"            # emerald — buttons, active tab, progress, focus
+backgroundColor = "#0D1117"         # main canvas (matches existing palette)
+secondaryBackgroundColor = "#161B22" # sidebar, cards, inputs, file uploader
+textColor = "#E6EDF3"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"             # hides the "Deploy" button / hamburger chrome
+
+[browser]
+gatherUsageStats = false

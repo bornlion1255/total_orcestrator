@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import re
-import time
 import io
-import json
+from pathlib import Path
 from datetime import datetime
+
+import broadcast_manager as bm
+import gsheet
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -115,6 +116,30 @@ header[data-testid="stHeader"] { background: #0D1117 !important; border-bottom: 
 </style>
 """, unsafe_allow_html=True)
 
+# ── ПОЛИРОВКА (актуальные селекторы Streamlit 1.58 + нативная emerald-тема) ────
+st.markdown("""
+<style>
+.block-container { max-width: 1080px; padding-top: 2.4rem; }
+h1 { font-size: 1.9rem !important; font-weight: 700 !important; letter-spacing: -.01em; }
+/* прогресс-бар в акцентный emerald */
+.stProgress > div > div > div > div { background: #10B981 !important; }
+/* красный — только у кнопки СТОП (scoped по её key), не у всех secondary */
+[class*="st-key-stop_"] button {
+    color: #F85149 !important; border: 1px solid #F85149 !important; background: transparent !important;
+}
+[class*="st-key-stop_"] button:hover { color: #fff !important; background: #F85149 !important; }
+/* локализация текста зоны загрузки файла */
+[data-testid="stFileUploaderDropzoneInstructions"] span { visibility: hidden; }
+[data-testid="stFileUploaderDropzoneInstructions"] span::after {
+    content: "Перетащите .xlsx сюда или выберите файл"; visibility: visible;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] small { visibility: hidden; }
+[data-testid="stFileUploaderDropzoneInstructions"] small::after {
+    content: "Лимит 200 МБ · только .xlsx"; visibility: visible;
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 # ── АВТОРИЗАЦИЯ ───────────────────────────────────────────────────────────────
 def check_password() -> bool:
@@ -152,6 +177,23 @@ except KeyError as e:
 WA_API_URL   = f"https://api.1msg.io/{WA_INSTANCE_ID}/sendTemplate?token={WA_TOKEN}"
 WA_NAMESPACE = "49276b64_15e7_414d_8f35_6ab04bcaa5b1"
 CHANNEL_LABELS = {"max": "MAX", "tlgrm": "Telegram", "chat": "In-App Chat"}
+
+# ── ДВИЖОК РАССЫЛКИ + ОПЦИОНАЛЬНОЕ ЗЕРКАЛО В GOOGLE SHEET ─────────────────────
+# Менеджер живёт в singleton (cache_resource) — фоновый поток переживает rerun и
+# разрыв вкладки. Google Sheet — durable-зеркало; без секретов работает на jsonl.
+GSHEET_ID = st.secrets.get("GSHEET_ID", "")
+GCP_SA = dict(st.secrets["gcp_service_account"]) if "gcp_service_account" in st.secrets else None
+
+@st.cache_resource
+def get_manager():
+    return bm.BroadcastManager(Path(__file__).parent / "runs")
+
+@st.cache_resource
+def get_sink(_sa, _sid):
+    return gsheet.GSheetSink(_sa, _sid)
+
+manager = get_manager()
+sink = get_sink(GCP_SA, GSHEET_ID)
 
 
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
@@ -213,71 +255,70 @@ with st.sidebar:
     delay_ms = st.slider("Задержка между отправками, мс", 100, 2000, 200, step=50)
 
 
-# ── ФУНКЦИИ ОТПРАВКИ ──────────────────────────────────────────────────────────
-def normalize_phone(phone: str) -> str:
-    d = re.sub(r'\D', '', str(phone))
-    if len(d) == 10: return "7" + d
-    if len(d) == 11 and d.startswith('8'): return "7" + d[1:]
-    return d
+# ── ПАРАМЕТРЫ РАССЫЛКИ + ХЕЛПЕРЫ ПРОГРЕССА ───────────────────────────────────
+def current_params() -> bm.BroadcastParams:
+    """Снимок настроек сайдбара + секретов — передаётся в фоновый воркер."""
+    return bm.BroadcastParams(
+        business_unit=business_unit, send_strategy=send_strategy, msg_text=msg_text,
+        type_value=full_type_value, tags=tags_list, cascade_order=cascade_order,
+        wa_template=wa_template, delay_ms=delay_ms,
+        yandex_cascade_url=YANDEX_CASCADE_URL, yandex_cleaning_url=YANDEX_CLEANING_URL,
+        wa_api_url=WA_API_URL, wa_namespace=WA_NAMESPACE,
+    )
 
-def _post(url: str, payload: dict) -> tuple[bool, str]:
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        return r.status_code == 200, r.text
-    except Exception as e:
-        return False, str(e)
+def results_to_df(records: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "Телефон": r.get("phone", ""), "Нормализован": r.get("normalized", ""),
+        "Доставлено": "Да" if r.get("delivered") else "Нет",
+        "Канал": r.get("channel", "—"), "Детали": r.get("detail", ""),
+    } for r in records])
 
-def send_himchistka_cascade(phone, msg, tv, tags, order):
-    return _post(YANDEX_CASCADE_URL, {
-        "phone": normalize_phone(phone), "message": msg, "type_value": tv,
-        "tags": tags, "target_sources": order
-    })
+@st.fragment(run_every="1s")
+def render_live(run_id: str):
+    """Живой прогресс. Тикает раз в секунду, читает состояние воркера из менеджера."""
+    state = manager.get(run_id)
+    if state is None:
+        st.info("Рассылка не найдена в памяти (инстанс мог перезапуститься) — смотри вкладку «История / Обрывы».")
+        return
+    snap = state.snapshot()
+    total = max(snap["total"], 1)
 
-def send_cleaning_hde(phone, msg, tv, tags, order):
-    return _post(YANDEX_CLEANING_URL, {
-        "phone": normalize_phone(phone), "message": msg, "type_value": tv,
-        "tags": tags, "target_sources": order
-    })
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Обработано", f'{snap["processed"]} / {snap["total"]}')
+    m2.metric("Доставлено", snap["delivered"])
+    m3.metric("Не доставлено", snap["failed"])
+    m4.metric("Осталось ~", f'{snap["eta"]} сек' if snap["status"] == "running" else "—")
 
-def send_wa(phone, template):
-    ok, raw = _post(WA_API_URL, {
-        "template": template, "language": {"policy": "deterministic", "code": "ru"},
-        "namespace": WA_NAMESPACE, "phone": normalize_phone(phone)
-    })
-    if ok:
-        try:
-            if json.loads(raw).get("sent"): return True, "sent"
-        except Exception: pass
-    return False, raw
+    st.progress(snap["processed"] / total,
+                text=f'{snap["processed"]} / {snap["total"]}  ·  статус: {snap["status"]}')
 
-def parse_response(ok: bool, raw: str) -> tuple[bool, str, str]:
-    if not ok: return False, raw[:120], "—"
-    try:
-        body = json.loads(raw)
-        return body.get("status") == "success", body.get("detail", ""), body.get("delivered_via", "—")
-    except Exception:
-        if "sent" in raw.lower(): return True, "WA доставлено", "whatsapp"
-        return True, "200 OK", "—"
+    if snap["status"] == "running":
+        st.button("СТОП", type="secondary", use_container_width=True, key=f"stop_{run_id}",
+                  on_click=manager.stop, args=(run_id,), help="Останавливает после текущего номера")
 
-def dispatch(phone: str) -> tuple[bool, str, bool, str, str]:
-    if business_unit == "Химчистка":
-        if send_strategy == "Каскад":
-            ok, raw = send_himchistka_cascade(phone, msg_text, full_type_value, tags_list, cascade_order)
-        else:  # WhatsApp шаблон
-            ok, raw = send_wa(phone, wa_template)
-    else:  # Клининг
-        ok, raw = send_cleaning_hde(phone, msg_text, full_type_value, tags_list, cascade_order)
-    delivered, detail, channel = parse_response(ok, raw)
-    return ok, raw, delivered, detail, channel
+    if snap["recent_log"]:
+        lines = []
+        for ln in snap["recent_log"]:
+            color = "#3FB950" if "[OK " in ln else "#F85149"
+            lines.append(f'<span style="color:{color}">{ln}</span>')
+        st.markdown(f'<div class="log-box">{"<br>".join(lines)}</div>', unsafe_allow_html=True)
+
+    if snap["status"] != "running":
+        st.rerun(scope="app")   # выходим из тикающего фрагмента к финальному отчёту
+
+def render_final(run_id: str, key_prefix: str):
+    state = manager.get(run_id)
+    records = state.results if state else manager.read_results(run_id)
+    if not records:
+        st.caption("Нет результатов.")
+        return
+    if state:
+        st.caption(f"Статус: **{state.status}** · обработано {state.processed} из {state.total}")
+    show_results(results_to_df(records), key_prefix=key_prefix)
 
 
 # ── СОСТОЯНИЕ РАССЫЛКИ ────────────────────────────────────────────────────────
-for _k, _v in [("bc_stop", False), ("bc_results", []), ("bc_phones", [])]:
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
-
-def _request_stop():
-    st.session_state.bc_stop = True
+# Состояние живёт в BroadcastManager (singleton); в сессии держим только id активного запуска.
 
 
 # ── ВСПОМОГАТЕЛЬНЫЕ: DONUT + ТАБЛИЦА ─────────────────────────────────────────
@@ -306,7 +347,7 @@ def show_donut(series: pd.Series, title: str):
     st.markdown(f"**{title}**")
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-def show_results(df: pd.DataFrame):
+def show_results(df: pd.DataFrame, key_prefix: str = ""):
     total       = len(df)
     delivered_n = (df["Доставлено"] == "Да").sum()
     failed_n    = total - delivered_n
@@ -357,7 +398,7 @@ def show_results(df: pd.DataFrame):
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="Отчёт")
     fname = f"рассылка_{business_unit.lower()}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-    st.download_button("Скачать отчёт (.xlsx)", data=buf.getvalue(),
+    st.download_button("Скачать отчёт (.xlsx)", data=buf.getvalue(), key=f"dl_{key_prefix}",
                        file_name=fname, mime="application/vnd.ms-excel", use_container_width=True)
 
 
@@ -369,7 +410,8 @@ st.markdown("---")
 
 cascade_blocked = send_strategy == "Каскад" and not cascade_order
 
-tab_single, tab_bulk, tab_help = st.tabs(["Один номер", "Массовая рассылка", "Инструкция"])
+tab_single, tab_bulk, tab_history, tab_help = st.tabs(
+    ["Один номер", "Массовая рассылка", "История / Обрывы", "Инструкция"])
 
 
 # ══ ВКЛАДКА: ОДИН НОМЕР ══════════════════════════════════════════════════════
@@ -393,8 +435,9 @@ with tab_single:
                 st.warning("Введите номер телефона.")
             else:
                 with st.spinner("Отправка..."):
-                    ok, raw, delivered, detail, channel = dispatch(raw_phone)
-                norm      = normalize_phone(raw_phone)
+                    res = bm.dispatch_one(current_params(), raw_phone)
+                delivered, detail, channel = res["delivered"], res["detail"], res["channel"]
+                norm, raw = res["normalized"], res["raw"]
                 css_class = "result-ok" if delivered else "result-fail"
                 s_html    = '<span class="tag-ok">ДОСТАВЛЕНО</span>' if delivered else '<span class="tag-fail">НЕ ДОСТАВЛЕНО</span>'
                 via_line  = f"<br>Канал:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{channel}" if delivered else ""
@@ -461,7 +504,7 @@ with tab_bulk:
             if dry_run:
                 validated = []
                 for p in phones:
-                    norm  = normalize_phone(p)
+                    norm  = bm.normalize_phone(p)
                     valid = len(norm) == 11 and norm.startswith("7")
                     validated.append({"Исходный": p, "Нормализован": norm,
                                       "Формат": "OK" if valid else "Проверить"})
@@ -485,74 +528,95 @@ with tab_bulk:
 
             else:
                 st.markdown("---")
+                running_id = manager.active_run_id()
 
-                if cascade_blocked:
+                if running_id:
+                    # Рассылка уже идёт (в т.ч. подхватываем после разрыва вкладки) — живой прогресс
+                    render_live(running_id)
+                elif cascade_blocked:
                     st.warning("Выберите хотя бы один канал в приоритете каскада.")
                 else:
-                    launch_col, stop_col = st.columns([3, 1])
-                    launch_clicked = launch_col.button(
-                        "ЗАПУСТИТЬ РАССЫЛКУ", use_container_width=True, key="btn_bulk", type="primary"
-                    )
-                    stop_col.button(
-                        "СТОП", on_click=_request_stop,
-                        type="secondary", use_container_width=True, key="btn_stop",
-                        help="Останавливает рассылку после текущего номера"
-                    )
+                    if st.button("ЗАПУСТИТЬ РАССЫЛКУ", use_container_width=True,
+                                 key="btn_bulk", type="primary"):
+                        rid = manager.start(current_params(), phones, sink)
+                        st.session_state.active_run_id = rid
+                        st.rerun()
+                    st.caption("Рассылка идёт в фоне — переживает разрыв вкладки. Прогресс и продолжение — во вкладке «История / Обрывы».")
 
-                    if launch_clicked:
-                        st.session_state.bc_stop    = False
-                        st.session_state.bc_results = []
-                        st.session_state.bc_phones  = phones
+                    last_id = st.session_state.get("active_run_id")
+                    if last_id and manager.get(last_id):
+                        render_final(last_id, key_prefix=f"bulk_{last_id}")
 
-                        progress_bar = st.progress(0, text="Запуск...")
-                        log_slot     = st.empty()
-                        log_lines: list[str] = []
-                        t_start      = time.time()
 
-                        for i, phone in enumerate(phones):
-                            if st.session_state.bc_stop:
-                                st.warning(f"Рассылка остановлена. Обработано: {i} из {len(phones)}.")
-                                break
+# ══ ВКЛАДКА: ИСТОРИЯ / ОБРЫВЫ ════════════════════════════════════════════════
+with tab_history:
+    st.markdown("Все запуски. Оборванные (`оборвана` / `остановлена`) можно продолжить с места обрыва — без повторов.")
+    if sink.enabled:
+        st.caption("Зеркало в Google Sheet: подключено ✓")
+    elif GCP_SA or GSHEET_ID:
+        st.caption(f"Google Sheet недоступен ({sink.error or 'проверь доступ'}) — работаем на локальном логе.")
+    else:
+        st.caption("Google Sheet не настроен — работаем на локальном логе (jsonl).")
 
-                            ok_flag, raw, delivered, detail, channel = dispatch(phone)
-                            norm = normalize_phone(phone)
+    STATUS_RU = {"running": "идёт", "completed": "завершена", "stopped": "остановлена",
+                 "interrupted": "оборвана", "error": "ошибка"}
+    runs = manager.list_runs()
 
-                            result = {
-                                "Телефон": phone, "Нормализован": norm,
-                                "Доставлено": "Да" if delivered else "Нет",
-                                "Канал": channel, "Детали": detail, "Raw": raw[:200],
-                            }
-                            st.session_state.bc_results.append(result)
+    if not runs:
+        st.info("Пока нет ни одного запуска.")
+    else:
+        overview = pd.DataFrame([{
+            "Запуск": r["run_id"], "Начало": r["started_at"].replace("T", " "),
+            "Направление": r["unit"], "Прогресс": f'{r["processed"]} / {r["total"]}',
+            "Доставлено": r["delivered"], "Не дост.": r["failed"],
+            "Статус": STATUS_RU.get(r["status"], r["status"]),
+        } for r in runs])
+        st.dataframe(overview, use_container_width=True, hide_index=True)
 
-                            ts    = datetime.now().strftime("%H:%M:%S")
-                            color = "#3FB950" if delivered else "#F85149"
-                            label = "OK  " if delivered else "FAIL"
-                            via   = channel if delivered else detail[:55]
-                            log_lines.append(
-                                f'<span style="color:{color}">[{ts}]  [{label}]  {norm}  {via}</span>'
-                            )
-                            if len(log_lines) > 14:
-                                log_lines = log_lines[-14:]
-                            log_slot.markdown(
-                                f'<div class="log-box">{"<br>".join(log_lines)}</div>',
-                                unsafe_allow_html=True
-                            )
+        sel = st.selectbox("Запуск для деталей / продолжения",
+                           [r["run_id"] for r in runs], key="hist_sel")
+        sel_run = next((r for r in runs if r["run_id"] == sel), None)
 
-                            done = i + 1
-                            elapsed = time.time() - t_start
-                            rate    = done / elapsed if elapsed > 0 else 1
-                            eta     = int((len(phones) - done) / rate)
-                            progress_bar.progress(
-                                done / len(phones),
-                                text=f"{done} / {len(phones)}  |  ETA {eta} сек"
-                            )
-                            time.sleep(delay_ms / 1000)
+        if sel_run:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Обработано", f'{sel_run["processed"]} / {sel_run["total"]}')
+            c2.metric("Доставлено", sel_run["delivered"])
+            c3.metric("Не доставлено", sel_run["failed"])
 
-                        log_slot.empty()
-                        progress_bar.empty()
+            incomplete = (sel_run["processed"] < sel_run["total"]
+                          and sel_run["status"] in ("interrupted", "stopped", "error"))
+            if incomplete:
+                remaining = manager.remaining_phones(sel)
+                st.warning(f'Оборвана на {sel_run["processed"]} из {sel_run["total"]}. Осталось: {len(remaining)}.')
+                rc1, rc2 = st.columns(2)
+                if rc1.button("ПРОДОЛЖИТЬ с места обрыва", type="primary",
+                              use_container_width=True, key="hist_resume"):
+                    m = manager.load_manifest(sel)
+                    params = bm.BroadcastParams.from_manifest(
+                        m["params"], yandex_cascade_url=YANDEX_CASCADE_URL,
+                        yandex_cleaning_url=YANDEX_CLEANING_URL,
+                        wa_api_url=WA_API_URL, wa_namespace=WA_NAMESPACE)
+                    if manager.resume(sel, params, sink):
+                        st.session_state.active_run_id = sel
+                        st.success("Продолжаем. Открой «Массовая рассылка» — там живой прогресс.")
+                        st.rerun()
+                    else:
+                        st.error("Нечего продолжать (нет остатка или манифеста).")
 
-                    if st.session_state.bc_results:
-                        show_results(pd.DataFrame(st.session_state.bc_results))
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+                    pd.DataFrame({"phone": remaining}).to_excel(
+                        w, index=False, header=False, sheet_name="Остаток")
+                rc2.download_button("Скачать остаток (.xlsx)", buf.getvalue(),
+                                    file_name=f"остаток_{sel}.xlsx",
+                                    use_container_width=True, key="hist_remainder")
+
+            with st.expander("Полный отчёт по запуску"):
+                recs = manager.read_results(sel)
+                if recs:
+                    show_results(results_to_df(recs), key_prefix=f"hist_{sel}")
+                else:
+                    st.caption("Нет записанных результатов.")
 
 
 # ══ ВКЛАДКА: ИНСТРУКЦИЯ ══════════════════════════════════════════════════════
