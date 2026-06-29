@@ -181,7 +181,7 @@ CHANNEL_LABELS = {"max": "MAX", "tlgrm": "Telegram", "chat": "In-App Chat"}
 # ── ДВИЖОК РАССЫЛКИ + ОПЦИОНАЛЬНОЕ ЗЕРКАЛО В GOOGLE SHEET ─────────────────────
 # Менеджер живёт в singleton (cache_resource) — фоновый поток переживает rerun и
 # разрыв вкладки. Google Sheet — durable-зеркало; без секретов работает на jsonl.
-GSHEET_ID = st.secrets.get("GSHEET_ID", "")
+GSHEET_ID = st.secrets.get("GSHEET_ID", "") or st.secrets.get("SHEET_ID", "")
 GCP_SA = dict(st.secrets["gcp_service_account"]) if "gcp_service_account" in st.secrets else None
 
 @st.cache_resource
@@ -322,7 +322,7 @@ def render_final(run_id: str, key_prefix: str):
 
 
 # ── ВСПОМОГАТЕЛЬНЫЕ: DONUT + ТАБЛИЦА ─────────────────────────────────────────
-def show_donut(series: pd.Series, title: str):
+def show_donut(series: pd.Series, title: str, key: str | None = None):
     if series.empty:
         st.caption("Нет данных")
         return
@@ -345,7 +345,7 @@ def show_donut(series: pd.Series, title: str):
                           font=dict(size=22, color="#E6EDF3"), showarrow=False)]
     )
     st.markdown(f"**{title}**")
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=key)
 
 def show_results(df: pd.DataFrame, key_prefix: str = ""):
     total       = len(df)
@@ -366,7 +366,7 @@ def show_results(df: pd.DataFrame, key_prefix: str = ""):
 
     with ch_col:
         ch_data = df[df["Доставлено"] == "Да"]["Канал"].value_counts()
-        show_donut(ch_data, "По каналам")
+        show_donut(ch_data, "По каналам", key=f"donut_{key_prefix}")
 
     with err_col:
         st.markdown("**Причины недоставки**")
@@ -374,7 +374,7 @@ def show_results(df: pd.DataFrame, key_prefix: str = ""):
         if not failed_df.empty:
             reasons = failed_df["Детали"].value_counts().reset_index()
             reasons.columns = ["Причина", "Количество"]
-            st.dataframe(reasons, use_container_width=True, hide_index=True)
+            st.dataframe(reasons, use_container_width=True, hide_index=True, key=f"reasons_{key_prefix}")
         else:
             st.success("Ошибок нет")
 
@@ -390,9 +390,9 @@ def show_results(df: pd.DataFrame, key_prefix: str = ""):
         return ["background-color:#200a0a; color:#F85149"] + ["background-color:#200a0a"] * (len(row)-1)
 
     try:
-        st.dataframe(display_df.style.apply(_row_color, axis=1), use_container_width=True, hide_index=True)
+        st.dataframe(display_df.style.apply(_row_color, axis=1), use_container_width=True, hide_index=True, key=f"table_{key_prefix}")
     except Exception:
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.dataframe(display_df, use_container_width=True, hide_index=True, key=f"tableplain_{key_prefix}")
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
