@@ -189,11 +189,13 @@ def get_manager():
     return bm.BroadcastManager(Path(__file__).parent / "runs")
 
 @st.cache_resource
-def get_sink(_sa, _sid):
-    return gsheet.GSheetSink(_sa, _sid)
+def get_sink(sheet_id, fingerprint, _sa):
+    # sheet_id + fingerprint(private_key_id) образуют ключ кэша → смена секретов
+    # пересоздаёт sink; _sa (dict) не хешируется и в ключ не входит.
+    return gsheet.GSheetSink(_sa, sheet_id)
 
 manager = get_manager()
-sink = get_sink(GCP_SA, GSHEET_ID)
+sink = get_sink(GSHEET_ID, (GCP_SA or {}).get("private_key_id", ""), GCP_SA)
 
 
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
@@ -553,10 +555,12 @@ with tab_history:
     st.markdown("Все запуски. Оборванные (`оборвана` / `остановлена`) можно продолжить с места обрыва — без повторов.")
     if sink.enabled:
         st.caption("Зеркало в Google Sheet: подключено ✓")
-    elif GCP_SA or GSHEET_ID:
-        st.caption(f"Google Sheet недоступен ({sink.error or 'проверь доступ'}) — работаем на локальном логе.")
     else:
-        st.caption("Google Sheet не настроен — работаем на локальном логе (jsonl).")
+        st.caption(
+            "Google Sheet не подключён — работаем на локальном логе.  "
+            f"GSHEET_ID: {'есть' if GSHEET_ID else 'НЕТ'} · "
+            f"gcp_service_account: {'есть' if GCP_SA else 'НЕТ'} · "
+            f"причина: {sink.error or '—'}")
 
     STATUS_RU = {"running": "идёт", "completed": "завершена", "stopped": "остановлена",
                  "interrupted": "оборвана", "error": "ошибка"}
