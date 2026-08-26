@@ -412,6 +412,17 @@ st.markdown("---")
 
 cascade_blocked = send_strategy == "Каскад" and not cascade_order
 
+# ── ГЛОБАЛЬНЫЙ СТОП ───────────────────────────────────────────────────────────
+# Менеджер — singleton на весь процесс, поэтому идущую рассылку видно из любой
+# сессии. Раньше прогресс и СТОП жили внутри `if uploaded_file:` во вкладке
+# «Массовая рассылка»: у того, кто не загружал файл в СВОЕЙ вкладке, кнопки не
+# было вовсе, и остановить чужой запуск было нечем.
+_active_id = manager.active_run_id()
+if _active_id:
+    st.error(f"**Идёт рассылка** `{_active_id}` — остановить можно прямо здесь.")
+    render_live(_active_id)
+    st.markdown("---")
+
 tab_single, tab_bulk, tab_history, tab_help = st.tabs(
     ["Один номер", "Массовая рассылка", "История / Обрывы", "Инструкция"])
 
@@ -463,10 +474,12 @@ with tab_bulk:
     uploaded_file = st.file_uploader("Файл .xlsx", type=["xlsx"], label_visibility="collapsed")
 
     if uploaded_file:
-        phones = []; parse_error = None
+        phones = []; parse_error = None; col_note = ""
         try:
             df_input = pd.read_excel(uploaded_file, header=None)
-            phones   = df_input.iloc[:, 0].dropna().astype(str).tolist()
+            # Столбец выбираем по содержимому, а не «первый попавшийся».
+            col_idx, col_note = bm.pick_phone_column(df_input)
+            phones   = df_input.iloc[:, col_idx].dropna().astype(str).tolist()
             phones   = [p for p in phones if re.search(r'\d', p)]
         except Exception as e:
             parse_error = str(e)
@@ -483,6 +496,31 @@ with tab_bulk:
                 st.warning(f"Найдено {dup_count} дублирующихся номеров — удалены автоматически. "
                            f"Осталось: {len(unique_phones)}.")
                 phones = unique_phones
+
+            # ── Валидация номеров (жёсткая, а не предупреждение) ──────────────
+            # Отбраковка обязана быть блокирующей: в HDE поиск идёт по префиксу,
+            # поэтому огрызок вроде "16" находит постороннего человека и письмо
+            # уходит ему. См. is_valid_phone() в broadcast_manager.
+            bad_rows = [{"Значение из файла": p, "После очистки": bm.normalize_phone(p)}
+                        for p in phones if not bm.is_valid_phone(bm.normalize_phone(p))]
+            phones = [p for p in phones if bm.is_valid_phone(bm.normalize_phone(p))]
+
+            st.caption(f"Распознан {col_note}")
+
+            if bad_rows:
+                share = len(bad_rows) / max(len(bad_rows) + len(phones), 1)
+                st.error(f"**Отбраковано {len(bad_rows)} строк** — это не телефоны. "
+                         f"Годных к отправке: {len(phones)}.")
+                if share > 0.3:
+                    st.error("Больше трети строк — мусор. Похоже, взят не тот столбец "
+                             "или не тот файл. Проверь выгрузку, прежде чем слать.")
+                with st.expander(f"Показать отбракованные ({len(bad_rows)})"):
+                    st.dataframe(pd.DataFrame(bad_rows), use_container_width=True,
+                                 hide_index=True)
+
+            if not phones:
+                st.error("Ни одного корректного номера — отправлять нечего.")
+                st.stop()
 
             # ── Pre-flight ────────────────────────────────────────────────────
             st.markdown("### Параметры запуска")
@@ -533,14 +571,25 @@ with tab_bulk:
                 running_id = manager.active_run_id()
 
                 if running_id:
-                    # Рассылка уже идёт (в т.ч. подхватываем после разрыва вкладки) — живой прогресс
-                    render_live(running_id)
+                    # Прогресс и СТОП живут в шапке страницы — второй раз тот же
+                    # фрагмент рисовать нельзя, ключи виджетов совпадут.
+                    st.info("Рассылка уже идёт — прогресс и кнопка СТОП вверху страницы.")
                 elif cascade_blocked:
                     st.warning("Выберите хотя бы один канал в приоритете каскада.")
                 else:
+                    ack = True
+                    if bad_rows:
+                        ack = st.checkbox(
+                            f"Понимаю: {len(bad_rows)} строк отброшено, отправляю "
+                            f"только по {len(phones)} корректным номерам",
+                            key="ack_bad")
                     if st.button("ЗАПУСТИТЬ РАССЫЛКУ", use_container_width=True,
-                                 key="btn_bulk", type="primary"):
-                        rid = manager.start(current_params(), phones, sink)
+                                 key="btn_bulk", type="primary", disabled=not ack):
+                        try:
+                            rid = manager.start(current_params(), phones, sink)
+                        except RuntimeError as e:
+                            st.error(str(e))
+                            st.stop()
                         st.session_state.active_run_id = rid
                         st.rerun()
                     st.caption("Рассылка идёт в фоне — переживает разрыв вкладки. Прогресс и продолжение — во вкладке «История / Обрывы».")

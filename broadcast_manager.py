@@ -51,6 +51,9 @@ class BroadcastParams:
 
 
 # ── pure send logic (moved out of orchestrator so the worker has no st.* deps) ──
+PHONE_RE = re.compile(r"^7\d{10}$")
+
+
 def normalize_phone(phone: str) -> str:
     d = re.sub(r"\D", "", str(phone))
     if len(d) == 10:
@@ -58,6 +61,35 @@ def normalize_phone(phone: str) -> str:
     if len(d) == 11 and d.startswith("8"):
         return "7" + d[1:]
     return d
+
+
+def is_valid_phone(norm: str) -> bool:
+    """Годен к отправке только российский номер ровно 7XXXXXXXXXX.
+
+    Не косметика. Поиск пользователя в HDE (`?search=`) работает по ПРЕФИКСУ:
+    `search=7` возвращает сотни чужих людей. Любой огрызок цифр, пропущенный
+    дальше, находит случайного абонента и рассылка уходит не тому. Так 25.08.2026
+    из-за столбца с email вместо телефонов ("novkot16@yandex.ru" -> "16") ушло
+    477 сообщений посторонним.
+    """
+    return bool(PHONE_RE.match(norm))
+
+
+def pick_phone_column(df) -> tuple[int, str]:
+    """Столбец с телефонами = где больше всего значений проходят is_valid_phone.
+
+    Слепой iloc[:, 0] брал первый столбец каким бы он ни был; в выгрузке с
+    email'ами в первой колонке это и стало началом аварии.
+    """
+    best_idx, best_hits = 0, -1
+    for i in range(df.shape[1]):
+        col = df.iloc[:, i].dropna().astype(str)
+        hits = sum(1 for v in col if is_valid_phone(normalize_phone(v)))
+        if hits > best_hits:
+            best_idx, best_hits = i, hits
+    total = len(df.iloc[:, best_idx].dropna())
+    note = f"столбец {best_idx + 1}: {best_hits} из {total} похожи на телефон"
+    return best_idx, note
 
 
 def _post(url: str, payload: dict) -> tuple[bool, str]:
@@ -103,6 +135,10 @@ def parse_response(ok: bool, raw: str) -> tuple[bool, str, str]:
 
 def dispatch_one(p: BroadcastParams, phone: str) -> dict:
     norm = normalize_phone(phone)
+    # Последний рубеж: ни один запрос не уходит, пока номер не подтверждён.
+    if not is_valid_phone(norm):
+        return {"normalized": norm, "delivered": False, "channel": "—",
+                "detail": "Некорректный номер — не отправлено", "raw": ""}
     if p.business_unit == "Химчистка":
         if p.send_strategy == "Каскад":
             ok, raw = _send_hde(p.yandex_cascade_url, norm, p)
@@ -174,6 +210,11 @@ class BroadcastManager:
 
     # ── public API ────────────────────────────────────────────────────────────
     def start(self, params: BroadcastParams, phones: list[str], sink=None) -> str:
+        # Двойной клик по «Запустить» (или две вкладки разом) поднимал два воркера
+        # на один список — каждый получатель ловил сообщение дважды.
+        active = self.active_run_id()
+        if active:
+            raise RuntimeError(f"Рассылка {active} уже идёт — дождитесь конца или нажмите СТОП.")
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         manifest = {
             "run_id": run_id, "started_at": _now(), "status": "running",
